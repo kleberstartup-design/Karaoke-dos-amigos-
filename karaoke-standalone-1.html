@@ -110,8 +110,9 @@ input[type=text]::placeholder{color:#7f9db8}
 .prog{flex:1;height:8px;border-radius:4px;background:var(--deep);overflow:hidden}
 .prog i{display:block;height:100%;width:0;background:var(--sun)}
 .mic{display:flex;align-items:center;gap:6px;color:var(--ink2);font-size:.8rem;font-weight:800;text-transform:uppercase;letter-spacing:.06em}
-.meter{width:64px;height:8px;border-radius:4px;background:var(--deep);overflow:hidden}
+.meter{position:relative;width:64px;height:8px;border-radius:4px;background:var(--deep);overflow:hidden}
 .meter i{display:block;height:100%;width:0;background:var(--mint)}
+.meter u{position:absolute;top:0;bottom:0;left:0;width:2px;background:var(--ink);text-decoration:none}
 .combo{background:var(--pink-btn);color:#fff;border-radius:99px;padding:0 12px;font-weight:800;animation:cpop .3s ease-out}
 .lyrics{margin-top:14px;min-height:8.5rem}
 .line{display:flex;flex-wrap:wrap;gap:0 .45em;font-weight:800;font-size:clamp(1.7rem,8.2vw,2.5rem);line-height:1.12}
@@ -181,6 +182,10 @@ input[type=text]::placeholder{color:#7f9db8}
       <label for="delay">Atraso do microfone: <output id="delayOut"></output></label>
       <input id="delay" type="range" min="0" max="0.6" step="0.05">
       <p class="hint">Se o placar parecer atrasado, aumente. Com fone bluetooth, tente entre 0,3 e 0,5 s.</p>
+      <label for="sens">Sensibilidade do microfone: <output id="sensOut"></output></label>
+      <input id="sens" type="range" min="1" max="10" step="1">
+      <p class="hint">Em lugar barulhento, diminua. Se o app não pega a sua voz, aumente. Na tela de cantar, a barrinha "mic" tem um traço branco: sua voz só conta quando passa dele.</p>
+      <label class="chk" for="auto"><input id="auto" type="checkbox"><span>Medir o barulho do ambiente antes de cantar (fique em silêncio no primeiro segundo)</span></label>
       <label class="chk" for="guide"><input id="guide" type="checkbox"><span>Tocar a melodia durante a música (só com fone de ouvido)</span></label>
     </details>
 
@@ -212,7 +217,7 @@ input[type=text]::placeholder{color:#7f9db8}
     <div class="belt">
       <div class="prog"><i id="prog"></i></div>
       <span id="combo" class="combo" hidden></span>
-      <div class="mic"><span>mic</span><div class="meter"><i id="meter"></i></div></div>
+      <div class="mic"><span>mic</span><div class="meter"><i id="meter"></i><u id="gateTick"></u></div></div>
     </div>
     <div class="lyrics"><div id="line" class="line"></div><div id="nextline" class="line next"></div></div>
   </section>
@@ -341,8 +346,13 @@ const store={
 
 const SONGS=RAW.map(buildSong);
 const byId=id=>SONGS.find(s=>s.id===id)||SONGS[0];
-const S={song:store.get('kg:song','estrela'),tr:store.get('kg:tr',0),delay:store.get('kg:delay',0.15),guide:store.get('kg:guide',false)};
+const S={song:store.get('kg:song','estrela'),tr:store.get('kg:tr',0),delay:store.get('kg:delay',0.15),guide:store.get('kg:guide',false),
+  sens:store.get('kg:sens',5),auto:store.get('kg:auto',true)};
 if(!SONGS.some(s=>s.id===S.song))S.song=SONGS[0].id;
+if(typeof S.sens!=='number'||S.sens<1||S.sens>10)S.sens=5;
+S.auto=S.auto!==false;
+// sensibilidade 1..10 vira corte de volume (RMS): 5 = 0,007
+const gateOf=s=>0.04*Math.pow(0.5,s/2);
 if(typeof S.tr!=='number'||S.tr<-6||S.tr>6)S.tr=0;
 if(typeof S.delay!=='number'||S.delay<0||S.delay>0.6)S.delay=0.15;
 
@@ -463,6 +473,9 @@ function renderTune(){
   $('#delay').value=String(S.delay);
   $('#delayOut').textContent=S.delay.toFixed(2).replace('.',',')+' s';
   $('#guide').checked=!!S.guide;
+  $('#sens').value=String(S.sens);
+  $('#sensOut').textContent=S.sens+' de 10';
+  $('#auto').checked=!!S.auto;
 }
 function show(name){
   ['home','sing','result'].forEach(id=>{$('#'+id).hidden=(id!==name);});
@@ -505,6 +518,7 @@ function startTurn(){
     tick:0,voiced:0,sumAcc:0,combo:0,maxCombo:0,samples:[],
     tickAcc:new Float32Array(song.nTicks).fill(-1),tickVoiced:new Uint8Array(song.nTicks),
     lineAcc:song.lines.map(()=>({ticks:0,acc:0,voiced:0})),
+    gate:gateOf(S.sens),manualGate:gateOf(S.sens),noise:[],calibrated:false,
     lastDetect:0,level:0,curLine:-1,lyrKey:'',sylEls:[],lastCount:'x',guide:null,pts:-1,
     used:Array.from(new Set(song.notes.map(n=>n.midi+S.tr)))};
   song.notes.forEach(n=>{delete n._sim;});
@@ -561,7 +575,18 @@ function detectOnce(st){
     analyser.getFloatTimeDomainData(buf);
     let s=0;for(let i=0;i<buf.length;i++)s+=buf[i]*buf[i];
     rms=Math.sqrt(s/buf.length);
-    if(rms>=0.008){
+    if(S.auto&&!run.calibrated){
+      if(st<-3*run.beat)run.noise.push(rms);
+      else{
+        run.calibrated=true;
+        if(run.noise.length>=5){
+          const a=run.noise.slice().sort((x,y)=>x-y),n=a[Math.floor(a.length*0.9)];
+          run.gate=Math.max(run.manualGate,n*2.2);
+          if(n>0.02)react('Barulho alto aqui! Cante bem perto do microfone.','ok');
+        }
+      }
+    }
+    if(rms>=run.gate&&(!S.auto||run.calibrated)){
       const r=yinPitch(buf,ctx.sampleRate);
       if(r&&r.freq>=70&&r.freq<=1000)midi=69+12*Math.log2(r.freq/440);
     }
@@ -695,7 +720,7 @@ function updateLyrics(st){
 }
 function updateCount(st){
   const b=run.beat;let t='';
-  if(st<-3*b)t='Prepara o gogó!';
+  if(st<-3*b)t=(S.auto&&!run.sim)?'Shh! Medindo o barulho...':'Prepara o gogó!';
   else if(st<-2*b)t='3';
   else if(st<-b)t='2';
   else if(st<0)t='1';
@@ -713,6 +738,7 @@ function updateHud(st){
   const c=$('#combo');
   if(run.combo>=3){c.hidden=false;c.textContent='Combo x'+run.combo;}else c.hidden=true;
   $('#meter').style.width=Math.min(100,run.level*900)+'%';
+  $('#gateTick').style.left=Math.min(98,run.gate*900)+'%';
   $('#prog').style.width=Math.max(0,Math.min(100,st/run.song.dur*100))+'%';
 }
 function frame(){
@@ -834,6 +860,8 @@ function init(){
   $('#hear').onclick=togglePreview;
   $('#delay').oninput=e=>{S.delay=parseFloat(e.target.value);store.set('kg:delay',S.delay);renderTune();};
   $('#guide').onchange=e=>{S.guide=e.target.checked;store.set('kg:guide',S.guide);};
+  $('#sens').oninput=e=>{S.sens=parseInt(e.target.value,10);store.set('kg:sens',S.sens);renderTune();};
+  $('#auto').onchange=e=>{S.auto=e.target.checked;store.set('kg:auto',S.auto);};
   $('#go').onclick=()=>begin(false);
   $('#demo').onclick=()=>begin(true);
   $('#stop').onclick=abort;
